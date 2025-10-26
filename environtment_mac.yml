@@ -1,0 +1,32 @@
+name: bert-mac
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - numpy>=1.26
+  - pandas
+  - scikit-learn>=1.5
+  - jupyterlab
+  - matplotlib
+  - pip:
+      - torch>=2.6
+      - torchvision>=0.21
+      - torchaudio>=2.6
+      - tokenizers>=0.20
+      - sentencepiece>=0.2
+      - datasets>=3.0
+      - accelerate>=0.34
+      - transformers>=4.46
+      - evaluate>=0.4
+      - safetensors>=0.4
+      - tensorboard
+      - tqdm
+      - rich
+      - loguru
+      - pre-commit
+      - black
+      - isort
+      - mypy

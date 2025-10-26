@@ -1,0 +1,67 @@
+# ── Data / large assets ─────────────────────────────────────────────
+/data/
+/datasets/
+/output/
+/models/
+/checkpoints/
+/*.h5
+/*.npz
+/*.ckpt
+/*.pth
+
+# ── System / OS specific files ─────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ── Python / ML artifacts ───────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+*.tlog
+*.tmp
+*.bak
+.mypy_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ── IDE & editor configs ──────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln
+*.dbmdl
+
+# ── Environment / dependency outputs ───────────────────────────────
+env/
+venv/
+.venv/
+*.env
+Pipfile.lock
+poetry.lock
+
+# ── Jupyter / notebook artifacts ──────────────────────────────────
+*.ipynb_checkpoints
+*.nbconvert.ipynb
+.ipynb_checkpoints/
+
+# ── Logs, temporary directories & build artifacts ──────────────────
+logs/
+*.log
+build/
+dist/
+*.egg-info/
+__MACOSX/
+
+# ── Other unwanted / secret files ─────────────────────────────────
+*.sqlite
+*.db
+secret*.json
+.env.local
+.env.development.local
+.env.production.local
