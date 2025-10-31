@@ -68,5 +68,32 @@ sample_text = "Hello, BERT!"
 encoded = tokenizer(sample_text)
 print(encoded)
 ```
+```python
+import torch
+import torchtext
+
+
+print("🔹 PyTorch version:", torch.__version__)
+print("🔹 Torchtext version:",torchtext.__version__)
+print("🔹 CUDA available:", torch.cuda.is_available())
+print("🔹 MPS available:", torch.backends.mps.is_available())
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    print(f"✅ Using CUDA GPU: {torch.cuda.get_device_name(0)}")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print("✅ Using Apple Silicon MPS backend.")
+else:
+    device = torch.device("cpu")
+    print("🧠 Falling back to CPU.")
+
+# sanity check tensor
+x = torch.rand(2, 2).to(device)
+print(f"\nTensor created on: {x.device}")
+
+
+
+```
 
 This will ensure your tokenizer is working correctly before proceeding with full model training.
