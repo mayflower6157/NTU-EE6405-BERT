@@ -70,11 +70,8 @@ print(encoded)
 ```
 ```python
 import torch
-import torchtext
-
 
 print("🔹 PyTorch version:", torch.__version__)
-print("🔹 Torchtext version:",torchtext.__version__)
 print("🔹 CUDA available:", torch.cuda.is_available())
 print("🔹 MPS available:", torch.backends.mps.is_available())
 
@@ -88,9 +85,7 @@ else:
     device = torch.device("cpu")
     print("🧠 Falling back to CPU.")
 
-# sanity check tensor
-x = torch.rand(2, 2).to(device)
-print(f"\nTensor created on: {x.device}")
+
 
 
 
