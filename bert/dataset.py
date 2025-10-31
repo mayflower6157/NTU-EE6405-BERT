@@ -1,67 +1,54 @@
+from loguru import logger
 import random
 import typing
-from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
-
-from tqdm import tqdm
 from torch.utils.data import Dataset
-from torchtext.vocab import vocab
-from torchtext.data.utils import get_tokenizer
-
+from tqdm import tqdm
+from transformers import BertTokenizerFast
+from datasets import Dataset as HFDataset
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class IMDBBertDataset(Dataset):
-    # Define Special tokens as attributes of class
-    CLS = "[CLS]"
-    PAD = "[PAD]"
-    SEP = "[SEP]"
-    MASK = "[MASK]"
-    UNK = "[UNK]"
-
-    MASK_PERCENTAGE = 0.15  # How much words to mask
-
-    MASKED_INDICES_COLUMN = "masked_indices"
-    TARGET_COLUMN = "indices"
-    NSP_TARGET_COLUMN = "is_next"
-    TOKEN_MASK_COLUMN = "token_mask"
-
+    MASK_PERCENTAGE = 0.15  # How much of the words to mask
     OPTIMAL_LENGTH_PERCENTILE = 70
+    MAX_LENGTH = 512  # BERT's maximum sequence length
 
     def __init__(self, path, ds_from=None, ds_to=None, should_include_text=False):
         self.ds: pd.Series = pd.read_csv(path)["review"]
-
         if ds_from is not None or ds_to is not None:
             self.ds = self.ds[ds_from:ds_to]
 
-        self.tokenizer = get_tokenizer("basic_english")
-        self.counter = Counter()
-        self.vocab = None
+        # Use pretrained BERT tokenizer
+        self.tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
         self.optimal_sentence_length = None
         self.should_include_text = should_include_text
 
         if should_include_text:
             self.columns = [
+                "masked_ids",
                 "masked_sentence",
-                self.MASKED_INDICES_COLUMN,
-                "sentence",
-                self.TARGET_COLUMN,
-                self.TOKEN_MASK_COLUMN,
-                self.NSP_TARGET_COLUMN,
+                "raw_text",
+                "token_mask",
+                "target_indices",
+                "attention_mask",
+                "is_next",
             ]
         else:
             self.columns = [
-                self.MASKED_INDICES_COLUMN,
-                self.TARGET_COLUMN,
-                self.TOKEN_MASK_COLUMN,
-                self.NSP_TARGET_COLUMN,
+                "masked_ids",
+                "token_mask",
+                "target_indices",
+                "attention_mask",
+                "is_next",
             ]
+
         self.df = self.prepare_dataset()
 
     def __len__(self):
@@ -70,63 +57,55 @@ class IMDBBertDataset(Dataset):
     def __getitem__(self, idx):
         item = self.df.iloc[idx]
 
-        inp = torch.Tensor(item[self.MASKED_INDICES_COLUMN]).long()
-        token_mask = torch.Tensor(item[self.TOKEN_MASK_COLUMN]).bool()
+        # Use masked_ids (numerical IDs) for input_ids
+        input_ids = torch.tensor(item["masked_ids"]).long()
 
-        mask_target = torch.Tensor(item[self.TARGET_COLUMN]).long()
-        mask_target = mask_target.masked_fill_(token_mask, 0)
+        # Use stored attention_mask from dataset
+        attention_mask = torch.tensor(item["attention_mask"]).long()
 
-        attention_mask = (inp == self.vocab[self.PAD]).unsqueeze(0)
+        # token_mask and target_indices are already padded to MAX_LENGTH
+        token_mask = torch.tensor(item["token_mask"]).bool()
+        target_indices = torch.tensor(item["target_indices"]).long()
 
-        if item[self.NSP_TARGET_COLUMN] == 0:
-            t = [1, 0]
-        else:
-            t = [0, 1]
-
-        nsp_target = torch.Tensor(t)
-
-        return (
-            inp.to(device),
-            attention_mask.to(device),
-            token_mask.to(device),
-            mask_target.to(device),
-            nsp_target.to(device),
+        # Next Sentence Prediction target
+        nsp_target = (
+            torch.tensor([1, 0]) if item["is_next"] == 0 else torch.tensor([0, 1])
         )
 
+        return {
+            "input_ids": input_ids.to(device),
+            "attention_mask": attention_mask.to(device),
+            "mlm_mask": token_mask.to(device),
+            "labels": target_indices.to(device),
+            "next_sentence_label": nsp_target.to(device),
+        }
+
     def prepare_dataset(self) -> pd.DataFrame:
-        sentences = []
-        nsp = []
+        sentences, nsp = [], []
         sentence_lens = []
 
-        # Split dataset on sentences
+        # Split dataset into sentences
         for review in self.ds:
             review_sentences = review.split(". ")
             sentences += review_sentences
             self._update_length(review_sentences, sentence_lens)
-        self.optimal_sentence_length = self._find_optimal_sentence_length(sentence_lens)
+        self.optimal_sentence_length = min(
+            self.MAX_LENGTH, self._find_optimal_sentence_length(sentence_lens)
+        )
 
-        print("Create vocabulary")
-        for sentence in tqdm(sentences):
-            s = self.tokenizer(sentence)
-            self.counter.update(s)
-
-        self._fill_vocab()
-
-        print("Preprocessing dataset")
+        logger.info("Preprocessing dataset...")
         for review in tqdm(self.ds):
             review_sentences = review.split(". ")
             if len(review_sentences) > 1:
                 for i in range(len(review_sentences) - 1):
-                    # True NSP item
-                    first, second = self.tokenizer(review_sentences[i]), self.tokenizer(
-                        review_sentences[i + 1]
-                    )
+                    # True NSP
+                    first, second = review_sentences[i], review_sentences[i + 1]
                     nsp.append(self._create_item(first, second, 1))
 
-                    # False NSP item
+                    # False NSP
                     first, second = self._select_false_nsp_sentences(sentences)
-                    first, second = self.tokenizer(first), self.tokenizer(second)
                     nsp.append(self._create_item(first, second, 0))
+
         df = pd.DataFrame(nsp, columns=self.columns)
         return df
 
@@ -140,128 +119,146 @@ class IMDBBertDataset(Dataset):
         arr = np.array(lengths)
         return int(np.percentile(arr, self.OPTIMAL_LENGTH_PERCENTILE))
 
-    def _fill_vocab(self):
-        # specials= argument is only in 0.12.0 version
-        # specials=[self.CLS, self.PAD, self.MASK, self.SEP, self.UNK]
-        self.vocab = vocab(self.counter, min_freq=2)
+    def _select_false_nsp_sentences(self, sentences: typing.List[str]):
+        sentences_len = len(sentences)
+        s1 = random.randint(0, sentences_len - 1)
+        s2 = random.randint(0, sentences_len - 1)
+        while s2 == s1 + 1:
+            s2 = random.randint(0, sentences_len - 1)
+        return sentences[s1], sentences[s2]
 
-        # 0.11.0 uses this approach to insert specials
-        self.vocab.insert_token(self.CLS, 0)
-        self.vocab.insert_token(self.PAD, 1)
-        self.vocab.insert_token(self.MASK, 2)
-        self.vocab.insert_token(self.SEP, 3)
-        self.vocab.insert_token(self.UNK, 4)
-        self.vocab.set_default_index(4)
+    def _create_item(self, first: str, second: str, is_next: int):
+        # Use tokenizer to handle truncation and padding to the model limit
+        encoding = self.tokenizer(
+            first,
+            second,
+            max_length=self.MAX_LENGTH,
+            truncation=True,
+            padding="max_length",
+            return_attention_mask=True,
+            return_special_tokens_mask=True,
+        )
 
-    def _create_item(
-        self, first: typing.List[str], second: typing.List[str], target: int = 1
-    ):
-        # Create masked sentence item
-        updated_first, first_mask = self._preprocess_sentence(first.copy())
-        updated_second, second_mask = self._preprocess_sentence(second.copy())
+        input_ids = encoding["input_ids"]
+        attention_mask = encoding["attention_mask"]
+        special_tokens_mask = encoding["special_tokens_mask"]
 
-        nsp_sentence = updated_first + [self.SEP] + updated_second
-        nsp_indices = self.vocab.lookup_indices(nsp_sentence)
-        inverse_token_mask = first_mask + [True] + second_mask
+        # Convert IDs back to tokens for optional inspection/debugging (strip padding)
+        tokens = [
+            token
+            for token, mask in zip(
+                self.tokenizer.convert_ids_to_tokens(input_ids), attention_mask
+            )
+            if mask == 1
+        ]
 
-        # Create sentence item without masking random words
-        first, _ = self._preprocess_sentence(first.copy(), should_mask=False)
-        second, _ = self._preprocess_sentence(second.copy(), should_mask=False)
-        original_nsp_sentence = first + [self.SEP] + second
-        original_nsp_indices = self.vocab.lookup_indices(original_nsp_sentence)
+        # Mask some tokens for MLM
+        masked_token_ids, token_mask, target_indices = self._mask_tokens(
+            input_ids, special_tokens_mask, attention_mask
+        )
+
+        masked_sentence_text = [
+            tok
+            for tok, m in zip(
+                self.tokenizer.convert_ids_to_tokens(masked_token_ids), attention_mask
+            )
+            if m == 1
+        ]
 
         if self.should_include_text:
             return (
-                nsp_sentence,
-                nsp_indices,
-                original_nsp_sentence,
-                original_nsp_indices,
-                inverse_token_mask,
-                target,
+                masked_token_ids,
+                masked_sentence_text,
+                tokens,
+                token_mask,
+                target_indices,
+                attention_mask,
+                is_next,
             )
         else:
-            return (nsp_indices, original_nsp_indices, inverse_token_mask, target)
+            return masked_token_ids, token_mask, target_indices, attention_mask, is_next
 
-    def _select_false_nsp_sentences(self, sentences: typing.List[str]):
-        """Select sentences to create false NSP item
-
-        Args:
-            sentences: list of all sentences
-
-        Returns:
-            tuple of two sentences. The second one NOT the next sentence
-        """
-        sentences_len = len(sentences)
-        sentence_index = random.randint(0, sentences_len - 1)
-        next_sentence_index = random.randint(0, sentences_len - 1)
-
-        # To be sure that it's not real next sentence
-        while next_sentence_index == sentence_index + 1:
-            next_sentence_index = random.randint(0, sentences_len - 1)
-
-        return sentences[sentence_index], sentences[next_sentence_index]
-
-    def _preprocess_sentence(
-        self, sentence: typing.List[str], should_mask: bool = True
+    def _mask_tokens(
+        self,
+        input_ids: typing.List[int],
+        special_tokens_mask: typing.List[int],
+        attention_mask: typing.List[int],
     ):
-        inverse_token_mask = None
-        if should_mask:
-            sentence, inverse_token_mask = self._mask_sentence(sentence)
-        sentence, inverse_token_mask = self._pad_sentence(
-            [self.CLS] + sentence, [True] + inverse_token_mask
-        )
+        len_s = len(input_ids)
+        token_mask = [True] * len_s
+        target_indices = input_ids.copy()
 
-        return sentence, inverse_token_mask
-
-    def _mask_sentence(self, sentence: typing.List[str]):
-        """Replace MASK_PERCENTAGE (15%) of words with special [MASK] symbol
-        or with random word from vocabulary
-
-        Args:
-            sentence: sentence to process
-
-        Returns:
-            tuple of processed sentence and inverse token mask
-        """
-        len_s = len(sentence)
-        inverse_token_mask = [
-            True for _ in range(max(len_s, self.optimal_sentence_length))
+        special_token_ids = set(self.tokenizer.all_special_ids)
+        # Eligible positions exclude special tokens and padding
+        candidate_indices = [
+            idx
+            for idx, (token_id, special_flag) in enumerate(
+                zip(input_ids, special_tokens_mask)
+            )
+            if special_flag == 0 and token_id not in special_token_ids
         ]
 
-        mask_amount = round(len_s * self.MASK_PERCENTAGE)
-        for _ in range(mask_amount):
-            i = random.randint(0, len_s - 1)
+        mask_amount = round(len(candidate_indices) * self.MASK_PERCENTAGE)
 
-            if random.random() < 0.8:
-                sentence[i] = self.MASK
+        mask_indices = random.sample(
+            candidate_indices, min(mask_amount, len(candidate_indices))
+        )
+
+        masked_token_ids = input_ids.copy()
+
+        for i in mask_indices:
+            prob = random.random()
+            if prob < 0.8:
+                # 80% Replace with [MASK]
+                masked_token_ids[i] = self.tokenizer.mask_token_id
+            elif prob < 0.9:
+                # 10% Replace with random token (excluding special tokens)
+                while True:
+                    rand_token_id = random.randint(0, self.tokenizer.vocab_size - 1)
+                    if rand_token_id not in special_token_ids:
+                        break
+                masked_token_ids[i] = rand_token_id
             else:
-                # All is below 5 is special token
-                # see self._insert_specials method
-                j = random.randint(5, len(self.vocab) - 1)
-                sentence[i] = self.vocab.lookup_token(j)
-            inverse_token_mask[i] = False
-        return sentence, inverse_token_mask
+                # 10% Keep original token (no change)
+                pass
+            token_mask[i] = False
 
-    def _pad_sentence(
-        self, sentence: typing.List[str], inverse_token_mask: typing.List[bool] = None
-    ):
-        len_s = len(sentence)
+        return masked_token_ids, token_mask, target_indices
 
-        if len_s >= self.optimal_sentence_length:
-            s = sentence[: self.optimal_sentence_length]
-        else:
-            s = sentence + [self.PAD] * (self.optimal_sentence_length - len_s)
+    def to_hf_dataset(self):
+        """Convert pandas DataFrame to Hugging Face Dataset efficiently."""
+        logger.info("Converting to Hugging Face Dataset...")
 
-        # inverse token mask should be padded as well
-        if inverse_token_mask:
-            len_m = len(inverse_token_mask)
-            if len_m >= self.optimal_sentence_length:
-                inverse_token_mask = inverse_token_mask[: self.optimal_sentence_length]
-            else:
-                inverse_token_mask = inverse_token_mask + [True] * (
-                    self.optimal_sentence_length - len_m
-                )
-        return s, inverse_token_mask
+        # Use stored attention_mask directly
+        masked_ids = self.df["masked_ids"].tolist()
+        attention_masks = self.df["attention_mask"].tolist()
+
+        # Create records dictionary with attention masks included
+        records = {
+            "input_ids": masked_ids,
+            "attention_mask": attention_masks,
+            "token_mask": self.df["token_mask"].tolist(),
+            "labels": self.df["target_indices"].tolist(),
+            "next_sentence_label": self.df["is_next"].tolist(),
+        }
+
+        # Create HuggingFace dataset from prepared records
+        hf_dataset = HFDataset.from_dict(records)
+
+        # Set tensor format
+        hf_dataset.set_format(
+            type="torch",
+            columns=[
+                "input_ids",
+                "attention_mask",
+                "token_mask",
+                "labels",
+                "next_sentence_label",
+            ],
+        )
+
+        logger.success(f"Dataset ready with {len(hf_dataset)} samples.")
+        return hf_dataset
 
 
 if __name__ == "__main__":
@@ -270,7 +267,22 @@ if __name__ == "__main__":
     ds = IMDBBertDataset(
         BASE_DIR.joinpath("data/imdb.csv"),
         ds_from=0,
-        ds_to=50000,
+        ds_to=5000,
         should_include_text=True,
     )
-    print(ds.df)
+
+    # Convert to Hugging Face Dataset
+    hf_ds = ds.to_hf_dataset()
+
+    # Show structure
+    logger.info("Hugging Face dataset preview:")
+    logger.info(hf_ds)
+
+    # Display a few sample records (pretty printed)
+    logger.info("Sample record 0:")
+    for k, v in hf_ds[0].items():
+        val = v.tolist() if torch.is_tensor(v) else v
+        print(f"{k}: {val[:20] if hasattr(val, '__getitem__') else val}")
+
+    print("\nReadable text:")
+    print(ds.tokenizer.decode(hf_ds[0]["input_ids"], skip_special_tokens=True))
