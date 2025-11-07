@@ -2,6 +2,11 @@ import torch
 
 from torch import nn
 import torch.nn.functional as f
+from transformers import BertTokenizerFast
+
+tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
+
+sep_id = tokenizer.sep_token_id  # → 102
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -15,16 +20,22 @@ class JointEmbedding(nn.Module):
         self.size = size
 
         self.token_emb = nn.Embedding(vocab_size, size)
-        self.segment_emb = nn.Embedding(vocab_size, size)
+        self.segment_emb = nn.Embedding(2, size)
 
         self.norm = nn.LayerNorm(size)
 
     def forward(self, input_tensor):
-        sentence_size = input_tensor.size(-1)
         pos_tensor = self.attention_position(self.size, input_tensor)
 
-        segment_tensor = torch.zeros_like(input_tensor).to(device)
-        segment_tensor[:, sentence_size // 2 + 1 :] = 1
+        sep_pos = (
+            (input_tensor == sep_id).int().argmax(dim=1)
+        )  # (batch_size, seq_len) -> (batch_size,)
+        sep_pos[sep_pos == 0] = input_tensor.size(1)
+        device = input_tensor.device
+        arange = torch.arange(input_tensor.size(1), device=device).unsqueeze(
+            0
+        )  # (1, seq_len)
+        segment_tensor = (arange > sep_pos.unsqueeze(1)).long()  # (batch_size, seq_len)
 
         output = (
             self.token_emb(input_tensor) + self.segment_emb(segment_tensor) + pos_tensor
@@ -63,7 +74,9 @@ class AttentionHead(nn.Module):
         self.k = nn.Linear(dim_inp, dim_out)
         self.v = nn.Linear(dim_inp, dim_out)
 
-    def forward(self, input_tensor: torch.Tensor, attention_mask: torch.Tensor = None):
+    def forward(
+        self, input_tensor: torch.Tensor, attention_mask: torch.Tensor = None
+    ):  # pyright: ignore[reportArgumentType]
         query, key, value = (
             self.q(input_tensor),
             self.k(input_tensor),
