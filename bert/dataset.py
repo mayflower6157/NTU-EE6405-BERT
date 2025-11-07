@@ -10,8 +10,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 from transformers import BertTokenizerFast
 from datasets import Dataset as HFDataset
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from utils.device_utils import get_device
 
 
 class IMDBBertDataset(Dataset):
@@ -19,7 +18,9 @@ class IMDBBertDataset(Dataset):
     OPTIMAL_LENGTH_PERCENTILE = 70
     MAX_LENGTH = 512  # BERT's maximum sequence length
 
-    def __init__(self, path, ds_from=None, ds_to=None, should_include_text=False):
+    def __init__(
+        self, path, ds_from=None, ds_to=None, should_include_text=False, device=None
+    ):
         self.ds: pd.Series = pd.read_csv(path)["review"]
         if ds_from is not None or ds_to is not None:
             self.ds = self.ds[ds_from:ds_to]
@@ -28,6 +29,7 @@ class IMDBBertDataset(Dataset):
         self.tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
         self.optimal_sentence_length = None
+        self.device = device or get_device()
         self.should_include_text = should_include_text
 
         if should_include_text:
@@ -57,27 +59,28 @@ class IMDBBertDataset(Dataset):
     def __getitem__(self, idx):
         item = self.df.iloc[idx]
 
-        # Use masked_ids (numerical IDs) for input_ids
-        input_ids = torch.tensor(item["masked_ids"]).long()
+        # Convert to tensors
+        input_ids = torch.tensor(item["masked_ids"], dtype=torch.long)
+        attention_mask = torch.tensor(
+            item["attention_mask"], dtype=torch.bool
+        )  # <- Bool
+        mlm_mask = torch.tensor(item["token_mask"], dtype=torch.bool)  # <- Bool
+        labels = torch.tensor(item["target_indices"], dtype=torch.long)
 
-        # Use stored attention_mask from dataset
-        attention_mask = torch.tensor(item["attention_mask"]).long()
+        # very important: ignore unmasked positions for MLM loss
+        labels = labels.clone()
+        labels[~mlm_mask] = 0  # 0 must match ignore_index in CrossEntropyLoss
 
-        # token_mask and target_indices are already padded to MAX_LENGTH
-        token_mask = torch.tensor(item["token_mask"]).bool()
-        target_indices = torch.tensor(item["target_indices"]).long()
-
-        # Next Sentence Prediction target
-        nsp_target = (
-            torch.tensor([1, 0]) if item["is_next"] == 0 else torch.tensor([0, 1])
+        nsp_target = torch.tensor(
+            [1, 0] if item["is_next"] == 0 else [0, 1], dtype=torch.float
         )
 
         return {
-            "input_ids": input_ids.to(device),
-            "attention_mask": attention_mask.to(device),
-            "mlm_mask": token_mask.to(device),
-            "labels": target_indices.to(device),
-            "next_sentence_label": nsp_target.to(device),
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "mlm_mask": mlm_mask,
+            "labels": labels,
+            "next_sentence_label": nsp_target,
         }
 
     def prepare_dataset(self) -> pd.DataFrame:
