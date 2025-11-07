@@ -1,8 +1,9 @@
+import pickle
 from loguru import logger
 import random
 import typing
+import os
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import torch
@@ -13,67 +14,158 @@ from datasets import Dataset as HFDataset
 from utils.device_utils import get_device
 
 
+class CacheLoadError(RuntimeError):
+    """Raised when an on-disk cache cannot be deserialized."""
+
+
 class IMDBBertDataset(Dataset):
-    MASK_PERCENTAGE = 0.15  # How much of the words to mask
+    MASK_PERCENTAGE = 0.15
     OPTIMAL_LENGTH_PERCENTILE = 70
-    MAX_LENGTH = 512  # BERT's maximum sequence length
+    MAX_LENGTH = 512  # BERT limit
 
     def __init__(
-        self, path, ds_from=None, ds_to=None, should_include_text=False, device=None
+        self,
+        path,
+        ds_from=None,
+        ds_to=None,
+        should_include_text=False,
+        device=None,
+        cache_dir=None,
+        overwrite_cache=False,
     ):
-        self.ds: pd.Series = pd.read_csv(path)["review"]
-        if ds_from is not None or ds_to is not None:
-            self.ds = self.ds[ds_from:ds_to]
-
-        # Use pretrained BERT tokenizer
-        self.tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
-
-        self.optimal_sentence_length = None
         self.device = device or get_device()
         self.should_include_text = should_include_text
+        self.tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
-        if should_include_text:
-            self.columns = [
-                "masked_ids",
-                "masked_sentence",
-                "raw_text",
-                "token_mask",
-                "target_indices",
-                "attention_mask",
-                "is_next",
-            ]
-        else:
-            self.columns = [
-                "masked_ids",
-                "token_mask",
-                "target_indices",
-                "attention_mask",
-                "is_next",
-            ]
+        # --- cache setup ---
+        cache_dir = Path(cache_dir or Path(path).parent / "cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_name = f"imdb_cached_{ds_from or 0}_{ds_to or 'end'}.pt"
+        self.cache_path = cache_dir / cache_name
 
-        self.df = self.prepare_dataset()
+        # --- try to load cache ---
+        cache_loaded = False
+        if self.cache_path.exists() and not overwrite_cache:
+            logger.info(f"🔁 Loading cached dataset from {self.cache_path}")
+            try:
+                self.df, self.columns = self._safe_load_cache(self.cache_path)
+                cache_loaded = True
+            except CacheLoadError as err:
+                logger.warning(
+                    "Cache at %s is unreadable (%s). Rebuilding...",
+                    self.cache_path,
+                    err,
+                )
 
+        if not cache_loaded:
+            logger.info(f"⚙️ Processing dataset from {path}")
+            self.ds: pd.Series = pd.read_csv(path)["review"]
+            if ds_from is not None or ds_to is not None:
+                self.ds = self.ds[ds_from:ds_to]
+
+            self.columns = (
+                [
+                    "masked_ids",
+                    "masked_sentence",
+                    "raw_text",
+                    "token_mask",
+                    "target_indices",
+                    "attention_mask",
+                    "is_next",
+                ]
+                if should_include_text
+                else [
+                    "masked_ids",
+                    "token_mask",
+                    "target_indices",
+                    "attention_mask",
+                    "is_next",
+                ]
+            )
+
+            self.df = self.prepare_dataset()
+            self._save_cache()
+
+    def _save_cache(self):
+        payload = {
+            "version": 2,
+            "columns": self.columns,
+            "data": {col: self.df[col].tolist() for col in self.df.columns},
+        }
+        torch.save(
+            payload,
+            self.cache_path,
+            pickle_protocol=pickle.HIGHEST_PROTOCOL,
+            _use_new_zipfile_serialization=False,
+        )
+        logger.success(f"✅ Cached dataset at {self.cache_path}")
+
+    # ---------------------------------------------------------------------- #
+    # safe cache load compatible with PyTorch 2.6+
+    def _safe_load_cache(self, path: Path):
+        import pandas as pd
+
+        try:
+            block_manager = pd.core.internals.managers.BlockManager
+        except AttributeError:
+            block_manager = None
+
+        safe_globals = [pd.DataFrame, pd.Series, pd.Index]
+        if block_manager is not None:
+            safe_globals.append(block_manager)
+        torch.serialization.add_safe_globals(safe_globals)
+
+        try:
+            try:
+                cached = torch.load(path, map_location="cpu", weights_only=False)
+            except TypeError:
+                cached = torch.load(path, map_location="cpu")
+        except (EOFError, RuntimeError, pickle.UnpicklingError) as err:
+            raise CacheLoadError("torch.load failed") from err
+
+        columns = cached.get("columns")
+
+        if "data" in cached:
+            df = pd.DataFrame(cached["data"], columns=columns)
+            return df, columns
+
+        if "df" in cached:  # legacy cache that stored raw DataFrame
+            df = cached["df"]
+            columns = columns or list(df.columns)
+            logger.info("♻️ Rewriting legacy cache with safe serialization format...")
+            self._rewrite_legacy_cache(path, df, columns)
+            return df, columns
+
+        raise CacheLoadError(f"Unsupported cache format in {path}")
+
+    def _rewrite_legacy_cache(self, path: Path, df: pd.DataFrame, columns):
+        safe_payload = {
+            "version": 2,
+            "columns": columns,
+            "data": {col: df[col].tolist() for col in columns},
+        }
+        torch.save(
+            safe_payload,
+            path,
+            pickle_protocol=pickle.HIGHEST_PROTOCOL,
+            _use_new_zipfile_serialization=False,
+        )
+        logger.success(f"Legacy cache upgraded at {path}")
+
+    # ---------------------------------------------------------------------- #
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         item = self.df.iloc[idx]
-
-        # Convert to tensors
         input_ids = torch.tensor(item["masked_ids"], dtype=torch.long)
-        attention_mask = torch.tensor(
-            item["attention_mask"], dtype=torch.bool
-        )  # <- Bool
-        mlm_mask = torch.tensor(item["token_mask"], dtype=torch.bool)  # <- Bool
+        attention_mask = torch.tensor(item["attention_mask"], dtype=torch.bool)
+        mlm_mask = torch.tensor(item["token_mask"], dtype=torch.bool)
         labels = torch.tensor(item["target_indices"], dtype=torch.long)
-
-        # very important: ignore unmasked positions for MLM loss
         labels = labels.clone()
-        labels[~mlm_mask] = 0  # 0 must match ignore_index in CrossEntropyLoss
+        labels[~mlm_mask] = 0  # ignore unmasked
 
-        nsp_target = torch.tensor(
-            [1, 0] if item["is_next"] == 0 else [0, 1], dtype=torch.float
-        )
+        nsp_target = torch.tensor([1, 0] if item["is_next"] == 0 else [0, 1], dtype=torch.float)
 
         return {
             "input_ids": input_ids,
@@ -83,55 +175,48 @@ class IMDBBertDataset(Dataset):
             "next_sentence_label": nsp_target,
         }
 
+    # ---------------------------------------------------------------------- #
     def prepare_dataset(self) -> pd.DataFrame:
-        sentences, nsp = [], []
-        sentence_lens = []
+        sentences, nsp, sentence_lens = [], [], []
 
-        # Split dataset into sentences
         for review in self.ds:
-            review_sentences = review.split(". ")
-            sentences += review_sentences
-            self._update_length(review_sentences, sentence_lens)
+            parts = review.split(". ")
+            sentences += parts
+            self._update_length(parts, sentence_lens)
         self.optimal_sentence_length = min(
             self.MAX_LENGTH, self._find_optimal_sentence_length(sentence_lens)
         )
 
-        logger.info("Preprocessing dataset...")
-        for review in tqdm(self.ds):
-            review_sentences = review.split(". ")
-            if len(review_sentences) > 1:
-                for i in range(len(review_sentences) - 1):
-                    # True NSP
-                    first, second = review_sentences[i], review_sentences[i + 1]
-                    nsp.append(self._create_item(first, second, 1))
+        logger.info("🧩 Preprocessing dataset...")
+        for review in tqdm(self.ds, total=len(self.ds)):
+            parts = review.split(". ")
+            if len(parts) > 1:
+                for i in range(len(parts) - 1):
+                    nsp.append(self._create_item(parts[i], parts[i + 1], 1))
+                    f, s = self._select_false_nsp_sentences(sentences)
+                    nsp.append(self._create_item(f, s, 0))
 
-                    # False NSP
-                    first, second = self._select_false_nsp_sentences(sentences)
-                    nsp.append(self._create_item(first, second, 0))
+        return pd.DataFrame(nsp, columns=self.columns)
 
-        df = pd.DataFrame(nsp, columns=self.columns)
-        return df
-
+    # ---------------------------------------------------------------------- #
     def _update_length(self, sentences: typing.List[str], lengths: typing.List[int]):
         for v in sentences:
-            l = len(v.split())
-            lengths.append(l)
+            lengths.append(len(v.split()))
         return lengths
 
     def _find_optimal_sentence_length(self, lengths: typing.List[int]):
-        arr = np.array(lengths)
-        return int(np.percentile(arr, self.OPTIMAL_LENGTH_PERCENTILE))
+        return int(np.percentile(np.array(lengths), self.OPTIMAL_LENGTH_PERCENTILE))
 
     def _select_false_nsp_sentences(self, sentences: typing.List[str]):
-        sentences_len = len(sentences)
-        s1 = random.randint(0, sentences_len - 1)
-        s2 = random.randint(0, sentences_len - 1)
+        s_len = len(sentences)
+        s1 = random.randint(0, s_len - 1)
+        s2 = random.randint(0, s_len - 1)
         while s2 == s1 + 1:
-            s2 = random.randint(0, sentences_len - 1)
+            s2 = random.randint(0, s_len - 1)
         return sentences[s1], sentences[s2]
 
+    # ---------------------------------------------------------------------- #
     def _create_item(self, first: str, second: str, is_next: int):
-        # Use tokenizer to handle truncation and padding to the model limit
         encoding = self.tokenizer(
             first,
             second,
@@ -141,151 +226,81 @@ class IMDBBertDataset(Dataset):
             return_attention_mask=True,
             return_special_tokens_mask=True,
         )
-
         input_ids = encoding["input_ids"]
         attention_mask = encoding["attention_mask"]
-        special_tokens_mask = encoding["special_tokens_mask"]
+        special_mask = encoding["special_tokens_mask"]
 
-        # Convert IDs back to tokens for optional inspection/debugging (strip padding)
-        tokens = [
-            token
-            for token, mask in zip(
-                self.tokenizer.convert_ids_to_tokens(input_ids), attention_mask
-            )
-            if mask == 1
-        ]
-
-        # Mask some tokens for MLM
-        masked_token_ids, token_mask, target_indices = self._mask_tokens(
-            input_ids, special_tokens_mask, attention_mask
-        )
-
-        masked_sentence_text = [
-            tok
-            for tok, m in zip(
-                self.tokenizer.convert_ids_to_tokens(masked_token_ids), attention_mask
-            )
-            if m == 1
-        ]
+        masked_ids, token_mask, targets = self._mask_tokens(input_ids, special_mask, attention_mask)
 
         if self.should_include_text:
             return (
-                masked_token_ids,
-                masked_sentence_text,
-                tokens,
+                masked_ids,
+                [t for t, m in zip(self.tokenizer.convert_ids_to_tokens(masked_ids), attention_mask) if m],
+                [t for t, m in zip(self.tokenizer.convert_ids_to_tokens(input_ids), attention_mask) if m],
                 token_mask,
-                target_indices,
+                targets,
                 attention_mask,
                 is_next,
             )
-        else:
-            return masked_token_ids, token_mask, target_indices, attention_mask, is_next
+        return masked_ids, token_mask, targets, attention_mask, is_next
 
-    def _mask_tokens(
-        self,
-        input_ids: typing.List[int],
-        special_tokens_mask: typing.List[int],
-        attention_mask: typing.List[int],
-    ):
-        len_s = len(input_ids)
-        token_mask = [True] * len_s
+    # ---------------------------------------------------------------------- #
+    def _mask_tokens(self, input_ids, special_mask, attention_mask):
+        token_mask = [True] * len(input_ids)
         target_indices = input_ids.copy()
-
-        special_token_ids = set(self.tokenizer.all_special_ids)
-        # Eligible positions exclude special tokens and padding
-        candidate_indices = [
-            idx
-            for idx, (token_id, special_flag) in enumerate(
-                zip(input_ids, special_tokens_mask)
-            )
-            if special_flag == 0 and token_id not in special_token_ids
+        specials = set(self.tokenizer.all_special_ids)
+        candidates = [
+            i
+            for i, (tid, sm) in enumerate(zip(input_ids, special_mask))
+            if sm == 0 and tid not in specials
         ]
+        n_mask = round(len(candidates) * self.MASK_PERCENTAGE)
+        mask_idx = random.sample(candidates, min(n_mask, len(candidates)))
+        masked_ids = input_ids.copy()
 
-        mask_amount = round(len(candidate_indices) * self.MASK_PERCENTAGE)
-
-        mask_indices = random.sample(
-            candidate_indices, min(mask_amount, len(candidate_indices))
-        )
-
-        masked_token_ids = input_ids.copy()
-
-        for i in mask_indices:
-            prob = random.random()
-            if prob < 0.8:
-                # 80% Replace with [MASK]
-                masked_token_ids[i] = self.tokenizer.mask_token_id
-            elif prob < 0.9:
-                # 10% Replace with random token (excluding special tokens)
+        for i in mask_idx:
+            r = random.random()
+            if r < 0.8:
+                masked_ids[i] = self.tokenizer.mask_token_id
+            elif r < 0.9:
                 while True:
-                    rand_token_id = random.randint(0, self.tokenizer.vocab_size - 1)
-                    if rand_token_id not in special_token_ids:
+                    rid = random.randint(0, self.tokenizer.vocab_size - 1)
+                    if rid not in specials:
+                        masked_ids[i] = rid
                         break
-                masked_token_ids[i] = rand_token_id
-            else:
-                # 10% Keep original token (no change)
-                pass
             token_mask[i] = False
 
-        return masked_token_ids, token_mask, target_indices
+        return masked_ids, token_mask, target_indices
 
+    # ---------------------------------------------------------------------- #
     def to_hf_dataset(self):
-        """Convert pandas DataFrame to Hugging Face Dataset efficiently."""
-        logger.info("Converting to Hugging Face Dataset...")
-
-        # Use stored attention_mask directly
-        masked_ids = self.df["masked_ids"].tolist()
-        attention_masks = self.df["attention_mask"].tolist()
-
-        # Create records dictionary with attention masks included
-        records = {
-            "input_ids": masked_ids,
-            "attention_mask": attention_masks,
+        logger.info("📦 Converting to Hugging Face Dataset...")
+        recs = {
+            "input_ids": self.df["masked_ids"].tolist(),
+            "attention_mask": self.df["attention_mask"].tolist(),
             "token_mask": self.df["token_mask"].tolist(),
             "labels": self.df["target_indices"].tolist(),
             "next_sentence_label": self.df["is_next"].tolist(),
         }
-
-        # Create HuggingFace dataset from prepared records
-        hf_dataset = HFDataset.from_dict(records)
-
-        # Set tensor format
-        hf_dataset.set_format(
-            type="torch",
-            columns=[
-                "input_ids",
-                "attention_mask",
-                "token_mask",
-                "labels",
-                "next_sentence_label",
-            ],
-        )
-
-        logger.success(f"Dataset ready with {len(hf_dataset)} samples.")
-        return hf_dataset
+        ds = HFDataset.from_dict(recs)
+        ds.set_format(type="torch", columns=list(recs.keys()))
+        logger.success(f"✅ Hugging Face dataset ready with {len(ds)} samples.")
+        return ds
 
 
 if __name__ == "__main__":
-    BASE_DIR = Path(__file__).resolve().parent.parent
-
+    BASE = Path(__file__).resolve().parent.parent
     ds = IMDBBertDataset(
-        BASE_DIR.joinpath("data/imdb.csv"),
+        BASE / "data/imdb.csv",
         ds_from=0,
         ds_to=5000,
         should_include_text=True,
+        cache_dir=BASE / "data/cache",
     )
-
-    # Convert to Hugging Face Dataset
     hf_ds = ds.to_hf_dataset()
-
-    # Show structure
-    logger.info("Hugging Face dataset preview:")
-    logger.info(hf_ds)
-
-    # Display a few sample records (pretty printed)
-    logger.info("Sample record 0:")
+    logger.info("Sample 0:")
     for k, v in hf_ds[0].items():
         val = v.tolist() if torch.is_tensor(v) else v
         print(f"{k}: {val[:20] if hasattr(val, '__getitem__') else val}")
-
     print("\nReadable text:")
-    print(ds.tokenizer.decode(hf_ds[0]["input_ids"], skip_special_tokens=True))
+    print(ds.tokenizer.decode(hf_ds[0]['input_ids'], skip_special_tokens=True))

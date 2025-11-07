@@ -20,7 +20,7 @@ HIDDEN_SIZE = 64        # Deeper hidden projection layer
 NUM_HEADS = 8           # 8 attention heads = more expressive self-attention
 BATCH_SIZE = 32         # Fits cleanly on RTX A5000 (24 GB VRAM)
 ACCUM_STEPS = 4         # Gradient accumulation → effective batch = 128
-EPOCHS = 1
+EPOCHS = 10
 LEARNING_RATE = 5e-5    # Base LR for cosine schedule
 WARMUP_RATIO = 0.1      # Warmup = 10% of total steps
 
